@@ -81,6 +81,11 @@ static char     save_path[80]      = {0};
 static volatile bool     cart_ram_dirty    = false;
 static volatile uint32_t last_ram_write_ms = 0;
 
+// Game picker: list of .gb/.gbc files found in the SD root.
+#define MAX_GAMES 64
+static char game_list[MAX_GAMES][80];
+static int  game_count = 0;
+
 // ── Peanut-GB callbacks ───────────────────────────────────────────────────────
 
 uint8_t gb_rom_read(struct gb_s *gb, const uint_fast32_t addr) { return rom_data[addr]; }
@@ -156,25 +161,112 @@ static bool loadROM(const char *path) {
   f.read(rom_data, rom_size);
   f.close();
   Serial.printf("ROM: %s (%u bytes)\n", path, rom_size);
+
+  // Derive save path: replace the ROM extension with ".sav".
+  strncpy(save_path, path, sizeof(save_path) - 1);
+  save_path[sizeof(save_path) - 1] = 0;
+  char *dot = strrchr(save_path, '.');
+  if (dot && (dot - save_path) < (int)(sizeof(save_path) - 5)) strcpy(dot, ".sav");
+  else strncat(save_path, ".sav", sizeof(save_path) - strlen(save_path) - 1);
   return true;
 }
 
-static bool findAndLoadROM() {
-  File root = SD_MMC.open("/");
-  if (!root || !root.isDirectory()) return false;
-  File entry;
-  while ((entry = root.openNextFile())) {
-    if (!entry.isDirectory()) {
-      String path = "/" + String(entry.name());
-      entry.close();
-      if (path.endsWith(".gb") || path.endsWith(".GB") ||
-          path.endsWith(".gbc") || path.endsWith(".GBC")) {
-        Serial.printf("Found: %s\n", path.c_str());
-        return loadROM(path.c_str());
-      }
-    } else { entry.close(); }
+// ── Battery saves ─────────────────────────────────────────────────────────────
+
+// Load the .sav file into cart RAM, if one exists and its size matches.
+static void loadSave(size_t ram_sz) {
+  if (!cart_ram || ram_sz == 0) return;
+  File f = SD_MMC.open(save_path, FILE_READ);
+  if (!f) { Serial.printf("No save file (%s)\n", save_path); return; }
+  if (f.size() == ram_sz) {
+    f.read(cart_ram, ram_sz);
+    Serial.printf("Loaded save: %s (%u bytes)\n", save_path, (unsigned)ram_sz);
+  } else {
+    Serial.printf("Save size mismatch (%u vs %u) - ignoring\n",
+                  (unsigned)f.size(), (unsigned)ram_sz);
   }
+  f.close();
+}
+
+// Overwrite the .sav file with current cart RAM. FILE_WRITE ("w") truncates.
+static void writeSave() {
+  size_t ram_sz = gb_get_save_size(&gb);
+  if (!cart_ram || ram_sz == 0) return;
+  File f = SD_MMC.open(save_path, FILE_WRITE);
+  if (!f) { Serial.printf("Save open failed (%s)\n", save_path); return; }
+  size_t w = f.write(cart_ram, ram_sz);
+  f.close();
+  Serial.printf("Saved: %s (%u bytes)\n", save_path, (unsigned)w);
+}
+
+// ── Game picker menu ──────────────────────────────────────────────────────────
+
+static void scanGames() {
+  game_count = 0;
+  File root = SD_MMC.open("/");
+  if (!root || !root.isDirectory()) return;
+  File entry;
+  while ((entry = root.openNextFile()) && game_count < MAX_GAMES) {
+    if (!entry.isDirectory()) {
+      String name = String(entry.name());
+      String lower = name; lower.toLowerCase();
+      if (lower.endsWith(".gb") || lower.endsWith(".gbc")) {
+        snprintf(game_list[game_count], sizeof(game_list[0]), "/%s", name.c_str());
+        Serial.printf("Found: %s\n", game_list[game_count]);
+        game_count++;
+      }
+    }
+    entry.close();
+  }
+}
+
+// True while the button with the given JOYPAD_* mask is held (active-low).
+static bool btnDown(uint8_t mask) {
+  for (int i = 0; i < NUM_BUTTONS; i++)
+    if (buttons[i].mask == mask) return digitalRead(buttons[i].pin) == LOW;
   return false;
+}
+
+static void drawMenu(int sel, int top, int visible) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setCursor(10, 8);
+  tft.printf("Select a game (%d)", game_count);
+  int y = 40;
+  for (int i = top; i < top + visible && i < game_count; i++) {
+    const char *name = game_list[i] + 1;   // skip leading '/'
+    if (i == sel) tft.setTextColor(TFT_BLACK, TFT_GREEN);
+    else          tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(10, y);
+    tft.printf("%c %s ", (i == sel) ? '>' : ' ', name);
+    y += 18;
+  }
+}
+
+// Blocking menu loop. Returns the selected game index. Runs during setup() while
+// disp_task is parked, so the TFT is ours to draw on directly.
+static int gameMenu() {
+  const int VISIBLE = 11;
+  int sel = 0, top = 0;
+  bool pUp = false, pDn = false, pOk = false;
+  drawMenu(sel, top, VISIBLE);
+  for (;;) {
+    bool up = btnDown(JOYPAD_UP);
+    bool dn = btnDown(JOYPAD_DOWN);
+    bool ok = btnDown(JOYPAD_A) || btnDown(JOYPAD_START);
+    bool changed = false;
+    if (up && !pUp) { sel = (sel - 1 + game_count) % game_count; changed = true; }
+    if (dn && !pDn) { sel = (sel + 1) % game_count;             changed = true; }
+    if (ok && !pOk) { return sel; }
+    pUp = up; pDn = dn; pOk = ok;
+    if (changed) {
+      if (sel < top)            top = sel;
+      if (sel >= top + VISIBLE) top = sel - VISIBLE + 1;
+      drawMenu(sel, top, VISIBLE);
+    }
+    delay(30);   // debounce + yield
+  }
 }
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
@@ -230,8 +322,11 @@ void setup() {
   SD_MMC.setPins(39, 38, 40);
   if (!SD_MMC.begin("/sdcard", true)) { msg("SD FAILED"); while (1) delay(1000); }
 
-  msg("Loading ROM...");
-  if (!findAndLoadROM()) { msg("No .gb file on SD!"); while (1) delay(1000); }
+  buttons_init();   // needed for menu navigation
+  scanGames();
+  if (game_count == 0) { msg("No .gb files on SD!"); while (1) delay(1000); }
+  int sel = gameMenu();
+  if (!loadROM(game_list[sel])) { msg("ROM load failed!"); while (1) delay(1000); }
 
   msg("Init emulator...");
   enum gb_init_error_e err = gb_init(&gb, gb_rom_read, gb_cart_ram_read,
@@ -242,10 +337,10 @@ void setup() {
   if (ram_sz > 0) {
     cart_ram = (uint8_t *)ps_malloc(ram_sz);
     memset(cart_ram, 0xFF, ram_sz);
+    loadSave(ram_sz);   // restore previous progress if a .sav exists
   }
 
   gb_init_lcd(&gb, lcd_draw_line);
-  buttons_init();
   Serial.println("Running");
 }
 
@@ -265,6 +360,13 @@ void loop() {
   gb_run_frame(&gb);
   xSemaphoreGive(sem_ready[emu_buf]);
   emu_buf ^= 1;
+
+  // Flush cart RAM to SD once writes have settled (~1.5s idle). Batches the
+  // burst of writes a game makes during a save into a single SD write.
+  if (cart_ram_dirty && (millis() - last_ram_write_ms) > 1500) {
+    cart_ram_dirty = false;
+    writeSave();
+  }
 
   frame_n++;
   if (millis() - fps_time >= 5000) {
