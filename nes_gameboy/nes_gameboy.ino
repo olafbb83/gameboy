@@ -1,11 +1,25 @@
+// Arduino-ESP32 compiles at -Os by default. The emulator core is a hot interpreter
+// loop, so force -O3 for everything defined in this translation unit (peanut_gb.h
+// is #included below, so gb_run_frame is optimised at O3 too).
+#pragma GCC optimize("O3")
+
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 #include <SD_MMC.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
 
-#define ENABLE_SOUND 0
+// ── Sound: Peanut-GB APU via minigb_apu ───────────────────────────────────────
+#include "minigb_apu.h"
+// Peanut-GB calls these bare hooks when ENABLE_SOUND is set. We declare them
+// before peanut_gb.h is included and define them in the Audio section below,
+// bridging to the context-based minigb_apu API.
+uint8_t audio_read(const uint16_t addr);
+void    audio_write(const uint16_t addr, const uint8_t val);
+
+#define ENABLE_SOUND 1
 #include "peanut_gb.h"
 
 // ── Display ───────────────────────────────────────────────────────────────────
@@ -42,9 +56,13 @@ static LGFX_Sprite fb(&tft);   // single sprite for display push
 #define GB_W   LCD_WIDTH    // 160
 #define GB_H   LCD_HEIGHT   // 144
 #define DISP_W 320
-#define DISP_H 240
+#define DISP_H 240          // physical panel height
+#define FB_H   216          // rendered framebuffer height (1.5× of GB's 144)
+#define FB_Y   12           // top border; sprite pushed here, borders stay black
 // Horizontal: 2× (160→320, fills screen width)
-// Vertical:   1.5× (144→216, fits in 240 with 12px border top/bottom)
+// Vertical:   1.5× (144→216, centred with a static 12px black border top/bottom)
+// The framebuffer holds only the 216 active rows, so the per-frame SPI push
+// sends 216 rows (not 240) — ~10% less data — and the borders are never redrawn.
 // Pattern: every 2 GB lines → 3 display rows; even GB lines doubled, odd single
 
 // ── Double buffering via two raw PSRAM pixel arrays ───────────────────────────
@@ -61,8 +79,8 @@ static void disp_task(void *) {
   int i = 0;
   for (;;) {
     xSemaphoreTake(sem_ready[i], portMAX_DELAY);
-    fb.setBuffer(render_buf[i], DISP_W, DISP_H, 16);
-    fb.pushSprite(0, 0);
+    fb.setBuffer(render_buf[i], DISP_W, FB_H, 16);
+    fb.pushSprite(0, FB_Y);
     xSemaphoreGive(sem_free[i]);
     i ^= 1;
   }
@@ -111,14 +129,74 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[GB_W], const uint_fast8
   // Odd  GB line → 1 display row  (base+2)
   // Result: 216 display rows, Y offset 12 (centered in 240).
   uint8_t *buf = (uint8_t *)render_buf[emu_buf];
-  int base_y = 12 + (int)(line / 2) * 3;
+  int base_y = (int)(line / 2) * 3;       // 0-based in the 216-row framebuffer
   int y_off  = (line & 1) ? 2 : 0;
   int rows   = (line & 1) ? 1 : 2;
   for (int r = 0; r < rows; r++) {
     int y = base_y + y_off + r;
-    if ((unsigned)y < (unsigned)DISP_H)
+    if ((unsigned)y < (unsigned)FB_H)
       memcpy(buf + y * (DISP_W * 2), sram_line, DISP_W * 2);
   }
+}
+
+// ── Sound output (LEDC PWM → NPN transistor → speaker on GPIO 1) ──────────────
+// minigb_apu synthesises 4-channel stereo at 32768 Hz. Each emulated frame we
+// mix it to mono, convert every sample to an 8-bit PWM duty, and queue it. A
+// 32768 Hz timer ISR pops one duty per tick and writes it to an LEDC PWM
+// channel. The transistor switches the speaker at the PWM carrier; the speaker
+// coil + 10uF cap low-pass the carrier back into the audio waveform.
+
+#define AUDIO_PIN      1
+#define AUDIO_CARRIER  100000   // PWM carrier; below LEDC ceiling, above audible
+#define AUDIO_RES_BITS 8
+#define AUDIO_GAIN     256      // 256 = unity; raise for louder, lower if harsh
+#define AUDIO_OUT_RATE 30000    // ISR consumer rate; lower it toward fps*548 if audio stutters
+#define AUDIO_TMR_BASE 8000000  // 8 MHz timer base (clean divider of 80 MHz source)
+
+static struct minigb_apu_ctx apu;
+static audio_sample_t audio_stream[AUDIO_SAMPLES_TOTAL];
+
+// Single-producer (emulator core) / single-consumer (timer ISR) ring of duties.
+#define ABUF_SIZE 2048          // power of two; holds ~3.7 frames of audio
+static volatile uint8_t  abuf[ABUF_SIZE];
+static volatile uint32_t ahead = 0, atail = 0;
+static hw_timer_t *audio_timer = nullptr;
+
+// Bridge Peanut-GB's sound hooks to the context-based minigb_apu API.
+uint8_t audio_read(const uint16_t addr) { return minigb_apu_audio_read(&apu, addr); }
+void    audio_write(const uint16_t addr, const uint8_t val) { minigb_apu_audio_write(&apu, addr, val); }
+
+// Timer ISR @ 32768 Hz: emit the next sample's duty to the PWM channel.
+static void ARDUINO_ISR_ATTR audio_isr() {
+  if (atail != ahead) {
+    uint8_t v = abuf[atail];
+    atail = (atail + 1) & (ABUF_SIZE - 1);
+    ledcWrite(AUDIO_PIN, v);
+  }
+  // else: ring empty — hold the last duty (brief silence), no underrun crash.
+}
+
+// Run once per emulated frame: synthesise audio and queue mono duty values.
+static void audioProduce() {
+  minigb_apu_audio_callback(&apu, audio_stream);
+  for (unsigned i = 0; i < AUDIO_SAMPLES; i++) {
+    int32_t m = ((int32_t)audio_stream[2 * i] + audio_stream[2 * i + 1]) >> 1; // L+R → mono
+    m = (m * AUDIO_GAIN) >> 8;
+    int32_t d = 128 + (m >> 8);          // int16 → 0..255 centred on mid-rail
+    if (d < 0) d = 0; else if (d > 255) d = 255;
+    uint32_t next = (ahead + 1) & (ABUF_SIZE - 1);
+    if (next != atail) { abuf[ahead] = (uint8_t)d; ahead = next; } // drop if full
+  }
+}
+
+static void audioInit() {
+  minigb_apu_audio_init(&apu);
+  if (!ledcAttach(AUDIO_PIN, AUDIO_CARRIER, AUDIO_RES_BITS))
+    Serial.println("ledcAttach FAILED - lower AUDIO_CARRIER");
+  ledcWrite(AUDIO_PIN, 128);             // mid-rail = silence
+  audio_timer = timerBegin(AUDIO_TMR_BASE);
+  timerAttachInterrupt(audio_timer, &audio_isr);
+  timerAlarm(audio_timer, AUDIO_TMR_BASE / AUDIO_OUT_RATE, true, 0);  // ≈32768 Hz
 }
 
 // ── Buttons ───────────────────────────────────────────────────────────────────
@@ -156,11 +234,17 @@ static bool loadROM(const char *path) {
   File f = SD_MMC.open(path);
   if (!f) return false;
   rom_size = f.size();
-  rom_data = (uint8_t *)ps_malloc(rom_size);
+  // Prefer fast internal RAM — gb_rom_read() hits the ROM on every opcode fetch,
+  // so internal SRAM is far quicker than PSRAM. Fall back to PSRAM for big ROMs
+  // that don't fit internally.
+  rom_data = (uint8_t *)heap_caps_malloc(rom_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  bool internal = (rom_data != nullptr);
+  if (!rom_data) rom_data = (uint8_t *)ps_malloc(rom_size);
   if (!rom_data) { f.close(); return false; }
   f.read(rom_data, rom_size);
   f.close();
-  Serial.printf("ROM: %s (%u bytes)\n", path, rom_size);
+  Serial.printf("ROM: %s (%u bytes) in %s\n", path, rom_size, internal ? "internal RAM" : "PSRAM");
+  Serial.printf("Free internal heap: %u\n", ESP.getFreeHeap());
 
   // Derive save path: replace the ROM extension with ".sav".
   strncpy(save_path, path, sizeof(save_path) - 1);
@@ -274,6 +358,8 @@ static int gameMenu() {
 void setup() {
   Serial.begin(115200);
 
+  Serial.printf("CPU: %u MHz\n", getCpuFrequencyMhz());
+
   tft.init();
   tft.setRotation(3);
   tft.fillScreen(TFT_BLACK);
@@ -290,14 +376,22 @@ void setup() {
 
   // Allocate two pixel buffers from PSRAM (no LovyanGFX sprite allocation limit)
   Serial.printf("Free PSRAM: %u bytes\n", ESP.getFreePsram());
+  const size_t fb_bytes = DISP_W * FB_H * sizeof(uint16_t);
   for (int i = 0; i < 2; i++) {
-    render_buf[i] = (uint16_t *)ps_malloc(DISP_W * DISP_H * sizeof(uint16_t));
+    // Put buffer 0 in fast internal DMA RAM (skips the PSRAM write stall in
+    // lcd_draw_line on alternate frames); buffer 1 stays in PSRAM. Both don't
+    // fit internally alongside the ROM, so this is the best split available.
+    render_buf[i] = (i == 0) ? (uint16_t *)heap_caps_malloc(fb_bytes, MALLOC_CAP_DMA)
+                             : nullptr;
+    bool got_internal = (render_buf[i] != nullptr);
+    if (!render_buf[i]) render_buf[i] = (uint16_t *)ps_malloc(fb_bytes);
     if (!render_buf[i]) {
       Serial.printf("render_buf[%d] ALLOC FAILED\n", i);
-      tft.println("PSRAM ALLOC FAIL");
+      tft.println("FB ALLOC FAIL");
       while (1) delay(1000);
     }
-    memset(render_buf[i], 0, DISP_W * DISP_H * 2);
+    Serial.printf("render_buf[%d] in %s\n", i, got_internal ? "internal" : "PSRAM");
+    memset(render_buf[i], 0, fb_bytes);
     sem_free[i]  = xSemaphoreCreateBinary();
     sem_ready[i] = xSemaphoreCreateBinary();
     xSemaphoreGive(sem_free[i]);
@@ -305,7 +399,7 @@ void setup() {
   // Initialise sprite geometry so pushSprite knows the dimensions.
   // setBuffer points it at render_buf[0] for now; disp_task swaps it each frame.
   fb.setColorDepth(16);
-  fb.setBuffer(render_buf[0], DISP_W, DISP_H, 16);
+  fb.setBuffer(render_buf[0], DISP_W, FB_H, 16);
 
   // Fully deinit the task WDT. disp_task runs continuously on Core 0 and
   // starves IDLE0; LovyanGFX also calls esp_task_wdt_reset() internally.
@@ -341,6 +435,7 @@ void setup() {
   }
 
   gb_init_lcd(&gb, lcd_draw_line);
+  audioInit();
   Serial.println("Running");
 }
 
@@ -352,12 +447,13 @@ void loop() {
   static uint32_t fps_time = 0;
 
   uint32_t now = micros();
-  if (now - last_us < 16742) return;
+  if (now - last_us < 16742) return;   // cap at the Game Boy's native 59.7 fps
   last_us = now;
 
   buttons_read();
   xSemaphoreTake(sem_free[emu_buf], portMAX_DELAY);
   gb_run_frame(&gb);
+  audioProduce();   // synthesise this frame's audio while regs are fresh
   xSemaphoreGive(sem_ready[emu_buf]);
   emu_buf ^= 1;
 
