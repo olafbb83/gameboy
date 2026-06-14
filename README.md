@@ -22,6 +22,9 @@ battery saves to the SD card.
 | Battery saves (`.sav` on SD) | ✅ Working (for cart-RAM games) |
 | On-device game picker menu | ✅ Working |
 | Sound (mono, PWM → transistor → speaker) | ✅ Working |
+| Selectable palettes (in-game hotkey) | ✅ Working |
+| Exit-to-menu hotkey (switch games live) | ✅ Working |
+| Volume control (in-game hotkey, persisted) | ✅ Working |
 | Color (Game Boy Color) | ❌ Not supported (Peanut-GB is DMG-only) |
 
 Tested games: Tetris, Super Mario Land (both DMG, 4-shade green).
@@ -138,6 +141,15 @@ GPIO 1 ──[1kΩ]── base
 3. The **game picker** appears. Navigate with **Up/Down**, select with **A** or **Start**.
 4. The game boots. Play with the D-pad and A/B/Start/Select.
 5. Saves are written automatically to a `.sav` file next to the ROM (see below).
+**In-game hotkeys** (Select is the modifier; all are masked from the game):
+
+| Combo | Action |
+|-------|--------|
+| Select + Up / Down | Cycle palette — Amber (default) → DMG Green → Pocket Gray → Grape Purple |
+| Select + Left / Right | Volume down / up (0 = mute … 512 = 2×, default 256) |
+| Select + Start | Return to game picker (auto-saves first) |
+
+Palette and volume are saved to NVS and restored at boot.
 
 Serial monitor (115200 baud) logs ROM info, save activity, and an FPS counter every 5 s.
 
@@ -217,11 +229,21 @@ register are active-low, a pressed pin simply clears its `JOYPAD_*` mask — no 
 - `AUDIO_OUT_RATE` — ISR consumer rate. Should match the audio *production* rate,
   which is `fps × 548`. At ~56 fps that's **30000**. If audio is raspy/buzzy, the consumer
   is outrunning the producer — lower this.
-- `AUDIO_GAIN` — 256 = unity; raise for louder, lower if harsh.
+- `audio_gain` — runtime volume (0 = mute … 512 = 2×, default `AUDIO_GAIN` = 256). Adjusted
+  live with Select + Left/Right, saved to NVS. Applied per-sample in `audioProduce()`.
 
 **Pitch note:** because production is tied to frame rate and the emulator runs ~56 fps
 (not 59.7), audio plays a touch low-pitched. A locked 59.7 fps would fix the pitch and let
 `AUDIO_OUT_RATE` return to 32768. Mono only (single speaker).
+
+### Palettes
+
+A small table of 4-shade palettes (light → dark) lives at the top of the sketch.
+`applyPalette(idx)` fills `dmg_palette[]` with the pre-bswapped RGB565 values. The in-game
+hotkey (Select + Up/Down) is edge-detected in `loop()` and the combo is masked out of
+`gb.direct.joypad` so it doesn't also move the player. The palette is swapped between frames,
+so the whole screen recolors cleanly on the next render. The chosen index is saved to NVS
+(`Preferences`) on change and restored at boot (defaults to Amber on first run).
 
 ### Battery saves
 
@@ -246,6 +268,18 @@ runs), so the TFT is free for direct text drawing. `scanGames()` lists all `.gb`
 in the SD root; `gameMenu()` draws a scrollable list and reads the D-pad live via `btnDown()`
 (edge-detected, one step per press), returning the chosen index.
 
+`startGame()` (load ROM → init emulator → restore save → reset APU) is shared by boot and the
+**exit-to-menu** path so they stay consistent.
+
+### Exit to menu (live game switching)
+
+The **Select + Start** hotkey calls `enterMenu()`, which: flushes the save, then **parks
+`disp_task`** by taking both `sem_free` semaphores (this also waits for any in-flight push to
+finish) so the menu can draw without the game overwriting it. It frees the old ROM/cart RAM,
+runs the picker, `startGame()`s the new ROM, and resumes. `emu_buf` is deliberately *not*
+reset — after draining, it already matches `disp_task`'s internal index, and they alternate in
+lockstep; forcing it would desync and deadlock.
+
 ---
 
 ## File layout
@@ -265,9 +299,8 @@ gameboy/
 
 ## Roadmap
 
-- [ ] Selectable / per-game palettes (grayscale, GBC-style DMG tints)
-- [ ] "Exit to menu" hotkey (return to picker without rebooting)
-- [ ] Volume control
+The core software feature set is complete. Remaining ideas:
+
 - [ ] Hardware power-loss detection for guaranteed saves
 - [ ] Enclosure + battery (true handheld)
 - [ ] (Stretch) lock 59.7 fps everywhere — needs both framebuffers in internal RAM

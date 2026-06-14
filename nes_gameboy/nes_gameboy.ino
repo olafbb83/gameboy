@@ -10,6 +10,7 @@
 #include <freertos/semphr.h>
 #include <esp_task_wdt.h>
 #include <esp_heap_caps.h>
+#include <Preferences.h>
 
 // ── Sound: Peanut-GB APU via minigb_apu ───────────────────────────────────────
 #include "minigb_apu.h"
@@ -139,6 +140,28 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[GB_W], const uint_fast8
   }
 }
 
+// ── DMG palettes ──────────────────────────────────────────────────────────────
+// Selectable 4-shade palettes (light → dark). Cycle in-game with Select + Up/Down.
+// Values are pre-bswapped on apply so pushSprite DMA (which sends bytes in memory
+// order) delivers the big-endian RGB565 the ST7789 expects.
+
+static const uint8_t palettes[][4][3] = {
+  {{0xFF,0xF2,0xD0},{0xE0,0xA8,0x40},{0x9C,0x5A,0x10},{0x2C,0x14,0x00}}, // Amber (default)
+  {{0xE0,0xF8,0xD0},{0x88,0xC0,0x70},{0x34,0x68,0x56},{0x08,0x18,0x20}}, // DMG green
+  {{0xFF,0xFF,0xFF},{0xA8,0xA8,0xA8},{0x54,0x54,0x54},{0x00,0x00,0x00}}, // Pocket gray
+  {{0xF0,0xE8,0xF8},{0xB0,0x88,0xD8},{0x68,0x40,0x98},{0x20,0x10,0x38}}, // Grape purple
+};
+static const int NUM_PALETTES = sizeof(palettes) / sizeof(palettes[0]);
+static int palette_idx = 0;
+static Preferences prefs;   // NVS storage for the chosen palette
+
+static void applyPalette(int idx) {
+  palette_idx = idx;
+  for (int i = 0; i < 4; i++)
+    dmg_palette[i] = __builtin_bswap16(
+        tft.color565(palettes[idx][i][0], palettes[idx][i][1], palettes[idx][i][2]));
+}
+
 // ── Sound output (LEDC PWM → NPN transistor → speaker on GPIO 1) ──────────────
 // minigb_apu synthesises 4-channel stereo at 32768 Hz. Each emulated frame we
 // mix it to mono, convert every sample to an 8-bit PWM duty, and queue it. A
@@ -149,9 +172,13 @@ void lcd_draw_line(struct gb_s *gb, const uint8_t pixels[GB_W], const uint_fast8
 #define AUDIO_PIN      1
 #define AUDIO_CARRIER  100000   // PWM carrier; below LEDC ceiling, above audible
 #define AUDIO_RES_BITS 8
-#define AUDIO_GAIN     256      // 256 = unity; raise for louder, lower if harsh
+#define AUDIO_GAIN     256      // default/unity gain (256 = 1×)
+#define AUDIO_GAIN_MAX 512      // max volume (2×); 0 = mute
+#define AUDIO_GAIN_STEP 64      // Select + Left/Right step
 #define AUDIO_OUT_RATE 30000    // ISR consumer rate; lower it toward fps*548 if audio stutters
 #define AUDIO_TMR_BASE 8000000  // 8 MHz timer base (clean divider of 80 MHz source)
+
+static int audio_gain = AUDIO_GAIN;   // runtime volume (0..AUDIO_GAIN_MAX), saved to NVS
 
 static struct minigb_apu_ctx apu;
 static audio_sample_t audio_stream[AUDIO_SAMPLES_TOTAL];
@@ -181,7 +208,7 @@ static void audioProduce() {
   minigb_apu_audio_callback(&apu, audio_stream);
   for (unsigned i = 0; i < AUDIO_SAMPLES; i++) {
     int32_t m = ((int32_t)audio_stream[2 * i] + audio_stream[2 * i + 1]) >> 1; // L+R → mono
-    m = (m * AUDIO_GAIN) >> 8;
+    m = (m * audio_gain) >> 8;
     int32_t d = 128 + (m >> 8);          // int16 → 0..255 centred on mid-rail
     if (d < 0) d = 0; else if (d > 255) d = 255;
     uint32_t next = (ahead + 1) & (ABUF_SIZE - 1);
@@ -190,7 +217,6 @@ static void audioProduce() {
 }
 
 static void audioInit() {
-  minigb_apu_audio_init(&apu);
   if (!ledcAttach(AUDIO_PIN, AUDIO_CARRIER, AUDIO_RES_BITS))
     Serial.println("ledcAttach FAILED - lower AUDIO_CARRIER");
   ledcWrite(AUDIO_PIN, 128);             // mid-rail = silence
@@ -231,6 +257,7 @@ static void buttons_read() {
 // ── ROM loading ───────────────────────────────────────────────────────────────
 
 static bool loadROM(const char *path) {
+  if (rom_data) { free(rom_data); rom_data = nullptr; }   // release previous ROM
   File f = SD_MMC.open(path);
   if (!f) return false;
   rom_size = f.size();
@@ -333,7 +360,11 @@ static void drawMenu(int sel, int top, int visible) {
 static int gameMenu() {
   const int VISIBLE = 11;
   int sel = 0, top = 0;
-  bool pUp = false, pDn = false, pOk = false;
+  // Seed with the current state so a button already held on entry (e.g. Start
+  // from the exit-to-menu combo) isn't seen as a fresh press and auto-selects.
+  bool pUp = btnDown(JOYPAD_UP);
+  bool pDn = btnDown(JOYPAD_DOWN);
+  bool pOk = btnDown(JOYPAD_A) || btnDown(JOYPAD_START);
   drawMenu(sel, top, VISIBLE);
   for (;;) {
     bool up = btnDown(JOYPAD_UP);
@@ -353,6 +384,49 @@ static int gameMenu() {
   }
 }
 
+// Load a ROM, (re)initialise the emulator, restore its save, reset the APU.
+// Used both at boot and when returning to the menu mid-game.
+static bool startGame(const char *path) {
+  if (cart_ram) { free(cart_ram); cart_ram = nullptr; }
+  if (!loadROM(path)) return false;
+  if (gb_init(&gb, gb_rom_read, gb_cart_ram_read, gb_cart_ram_write,
+              gb_error, nullptr) != GB_INIT_NO_ERROR) return false;
+  size_t ram_sz = gb_get_save_size(&gb);
+  if (ram_sz > 0) {
+    cart_ram = (uint8_t *)ps_malloc(ram_sz);
+    memset(cart_ram, 0xFF, ram_sz);
+    loadSave(ram_sz);                 // restore previous progress if a .sav exists
+  }
+  gb_init_lcd(&gb, lcd_draw_line);
+  minigb_apu_audio_init(&apu);        // fresh sound state for the new game
+  return true;
+}
+
+// Exit to the game picker mid-game: flush the save, park the display so the menu
+// isn't overwritten, pick a new game, and resume. Runs on Core 1.
+static void enterMenu() {
+  if (cart_ram_dirty) { cart_ram_dirty = false; writeSave(); }
+
+  // Take both buffers so disp_task can't push over the menu (this also waits for
+  // any in-flight push to finish). disp_task then parks on sem_ready.
+  xSemaphoreTake(sem_free[0], portMAX_DELAY);
+  xSemaphoreTake(sem_free[1], portMAX_DELAY);
+
+  ahead = atail = 0;                  // drop queued audio
+  ledcWrite(AUDIO_PIN, 128);          // hold speaker at mid-rail (silence)
+
+  scanGames();
+  int sel = gameMenu();
+  startGame(game_list[sel]);
+
+  tft.fillScreen(TFT_BLACK);          // clear menu text incl. the borders
+  // Don't touch emu_buf: after draining both buffers, disp_task is parked on the
+  // index that already matches emu_buf. They alternate in lockstep — resetting
+  // here would desync the two and deadlock.
+  xSemaphoreGive(sem_free[0]);
+  xSemaphoreGive(sem_free[1]);
+}
+
 // ── Setup ─────────────────────────────────────────────────────────────────────
 
 void setup() {
@@ -366,13 +440,14 @@ void setup() {
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(2);
 
-  // Classic DMG green palette.
-  // Pre-bswapped so pushSprite DMA (which sends bytes in memory order) delivers
-  // the correct big-endian byte sequence that ST7789 expects over SPI.
-  dmg_palette[0] = __builtin_bswap16(tft.color565(0xE0, 0xF8, 0xD0));
-  dmg_palette[1] = __builtin_bswap16(tft.color565(0x88, 0xC0, 0x70));
-  dmg_palette[2] = __builtin_bswap16(tft.color565(0x34, 0x68, 0x56));
-  dmg_palette[3] = __builtin_bswap16(tft.color565(0x08, 0x18, 0x20));
+  // Restore the last-used palette from NVS (defaults to Amber on first boot).
+  prefs.begin("gameboy", false);
+  int savedPal = prefs.getInt("palette", 0);
+  if (savedPal < 0 || savedPal >= NUM_PALETTES) savedPal = 0;
+  applyPalette(savedPal);
+  audio_gain = prefs.getInt("volume", AUDIO_GAIN);
+  if (audio_gain < 0) audio_gain = 0;
+  if (audio_gain > AUDIO_GAIN_MAX) audio_gain = AUDIO_GAIN_MAX;
 
   // Allocate two pixel buffers from PSRAM (no LovyanGFX sprite allocation limit)
   Serial.printf("Free PSRAM: %u bytes\n", ESP.getFreePsram());
@@ -420,22 +495,11 @@ void setup() {
   scanGames();
   if (game_count == 0) { msg("No .gb files on SD!"); while (1) delay(1000); }
   int sel = gameMenu();
-  if (!loadROM(game_list[sel])) { msg("ROM load failed!"); while (1) delay(1000); }
-
-  msg("Init emulator...");
-  enum gb_init_error_e err = gb_init(&gb, gb_rom_read, gb_cart_ram_read,
-                                      gb_cart_ram_write, gb_error, nullptr);
-  if (err != GB_INIT_NO_ERROR) { tft.printf("GB init err: %d", err); while (1) delay(1000); }
-
-  size_t ram_sz = gb_get_save_size(&gb);
-  if (ram_sz > 0) {
-    cart_ram = (uint8_t *)ps_malloc(ram_sz);
-    memset(cart_ram, 0xFF, ram_sz);
-    loadSave(ram_sz);   // restore previous progress if a .sav exists
-  }
-
-  gb_init_lcd(&gb, lcd_draw_line);
+  if (!startGame(game_list[sel])) { msg("Game start failed!"); while (1) delay(1000); }
   audioInit();
+  // Clear the menu/setup text. The game framebuffer only covers the 216 active
+  // rows, so the 12px top/bottom borders are never redrawn — blank them once here.
+  tft.fillScreen(TFT_BLACK);
   Serial.println("Running");
 }
 
@@ -451,6 +515,55 @@ void loop() {
   last_us = now;
 
   buttons_read();
+
+  // Palette hotkey: Select + Up = next, Select + Down = previous. Edge-detected,
+  // and suppressed from the game so the combo doesn't also move the player.
+  static bool palette_combo = false;
+  bool sel = btnDown(JOYPAD_SELECT);
+  bool pUp = btnDown(JOYPAD_UP);
+  bool pDn = btnDown(JOYPAD_DOWN);
+  if (sel && (pUp || pDn)) {
+    if (!palette_combo) {
+      applyPalette((palette_idx + (pUp ? 1 : NUM_PALETTES - 1)) % NUM_PALETTES);
+      prefs.putInt("palette", palette_idx);   // remember across reboots
+      Serial.printf("Palette %d\n", palette_idx);
+    }
+    palette_combo = true;
+    gb.direct.joypad |= JOYPAD_SELECT | JOYPAD_UP | JOYPAD_DOWN;  // active-low: set = released
+  } else {
+    palette_combo = false;
+  }
+
+  // Volume hotkey: Select + Right = louder, Select + Left = quieter (0 = mute).
+  static bool volume_combo = false;
+  bool pLeft  = btnDown(JOYPAD_LEFT);
+  bool pRight = btnDown(JOYPAD_RIGHT);
+  if (sel && (pLeft || pRight)) {
+    if (!volume_combo) {
+      audio_gain += pRight ? AUDIO_GAIN_STEP : -AUDIO_GAIN_STEP;
+      if (audio_gain < 0) audio_gain = 0;
+      if (audio_gain > AUDIO_GAIN_MAX) audio_gain = AUDIO_GAIN_MAX;
+      prefs.putInt("volume", audio_gain);   // remember across reboots
+      Serial.printf("Volume %d/%d\n", audio_gain, AUDIO_GAIN_MAX);
+    }
+    volume_combo = true;
+    gb.direct.joypad |= JOYPAD_SELECT | JOYPAD_LEFT | JOYPAD_RIGHT;
+  } else {
+    volume_combo = false;
+  }
+
+  // Exit-to-menu hotkey: Select + Start returns to the game picker (edge-detected
+  // so it fires once, and so a held Start after picking doesn't re-open it).
+  static bool exit_combo = false;
+  bool exitNow = sel && btnDown(JOYPAD_START);
+  if (exitNow && !exit_combo) {
+    enterMenu();
+    last_us = micros();   // re-pace the frame gate after the blocking menu
+    exit_combo = true;
+    return;
+  }
+  exit_combo = exitNow;
+
   xSemaphoreTake(sem_free[emu_buf], portMAX_DELAY);
   gb_run_frame(&gb);
   audioProduce();   // synthesise this frame's audio while regs are fresh
